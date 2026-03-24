@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""
+语言模型训练脚本
+- 使用Hugging Face Transformers和Datasets
+- 针对RTX 4060 8GB显存优化
+- 支持混合精度和梯度检查点
+- 完整的日志记录和监控
+"""
+
+import os
+import sys
+import time
+import logging
+from datetime import datetime
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from transformers import (
+    GPT2LMHeadModel, 
+    GPT2Tokenizer,
+    TrainingArguments,
+    Trainer,
+    default_data_collator,
+)
+from datasets import load_dataset
+import config
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
+from rich.logging import RichHandler
+
+# 初始化日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[RichHandler(rich_tracebacks=True)]
+)
+logger = logging.getLogger(__name__)
+console = Console()
+
+def setup_environment():
+    """设置环境变量和性能优化"""
+    logger.info("Setting up environment...")
+    
+    # 性能优化
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # 设置设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+    
+    if device.type == "cuda":
+        logger.info(f"CUDA version: {torch.version.cuda}")
+        logger.info(f"GPU device: {torch.cuda.get_device_name(0)}")
+        logger.info(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+    
+    return device
+
+def load_and_preprocess_data():
+    """加载和预处理数据集"""
+    logger.info("Loading and preprocessing dataset...")
+    
+    try:
+        # 从Hugging Face加载数据集
+        dataset = load_dataset(
+            config.DATASET_CONFIG["name"],
+            config.DATASET_CONFIG["config_name"],
+            cache_dir=config.DATASET_CONFIG["cache_dir"],
+            trust_remote_code=True
+        )
+        
+        logger.info(f"Dataset loaded successfully!")
+        logger.info(f"Train samples: {len(dataset['train'])}")
+        logger.info(f"Validation samples: {len(dataset['validation'])}")
+        
+        # 加载tokenizer
+        tokenizer = GPT2Tokenizer.from_pretrained(config.MODEL_CONFIG["base_model"])
+        tokenizer.pad_token = tokenizer.eos_token
+        
+        # Tokenize函数
+        def tokenize_function(examples):
+            return tokenizer(
+                examples["text"],
+                padding="max_length",
+                truncation=True,
+                max_length=config.MODEL_CONFIG["max_length"],
+                return_tensors="pt"
+            )
+        
+        # 应用tokenize
+        logger.info("Tokenizing dataset...")
+        tokenized_datasets = dataset.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["text", "id", "title"] if "title" in dataset["train"].column_names else ["text", "id"],
+            desc="Tokenizing",
+            load_from_cache_file=True,
+            cache_file_names={
+                "train": os.path.join(config.DATA_DIR, "train_tokenized.cache"),
+                "validation": os.path.join(config.DATA_DIR, "validation_tokenized.cache")
+            }
+        )
+        
+        # 设置格式为PyTorch
+        tokenized_datasets.set_format(type="torch", columns=["input_ids", "attention_mask"])
+        
+        return tokenized_datasets, tokenizer
+    
+    except Exception as e:
+        logger.error(f"Error loading dataset: {str(e)}")
+        logger.info("Falling back to dummy dataset for testing...")
+        return create_dummy_dataset()
+
+def create_dummy_dataset():
+    """创建虚拟数据集用于测试"""
+    logger.warning("Creating dummy dataset for testing...")
+    
+    tokenizer = GPT2Tokenizer.from_pretrained(config.MODEL_CONFIG["base_model"])
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    # 创建简单的测试数据
+    train_texts = ["This is a test sentence. "] * 1000
+    val_texts = ["This is a validation sentence. "] * 100
+    
+    train_dataset = tokenizer(train_texts, padding="max_length", truncation=True, max_length=config.MODEL_CONFIG["max_length"], return_tensors="pt")
+    val_dataset = tokenizer(val_texts, padding="max_length", truncation=True, max_length=config.MODEL_CONFIG["max_length"], return_tensors="pt")
+    
+    return {
+        "train": train_dataset,
+        "validation": val_dataset
+    }, tokenizer
+
+def create_model():
+    """创建和配置模型"""
+    logger.info(f"Creating model: {config.MODEL_CONFIG['base_model']}")
+    
+    try:
+        model = GPT2LMHeadModel.from_pretrained(config.MODEL_CONFIG["base_model"])
+        
+        # 启用梯度检查点
+        if config.HARDWARE_CONFIG["gradient_checkpointing"]:
+            model.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled")
+        
+        # 8-bit优化（未来扩展）
+        if config.SCALING_CONFIG["use_8bit_optimization"]:
+            try:
+                from bitsandbytes.optim import AdamW8bit
+                logger.info("8-bit optimization enabled (for future use)")
+            except ImportError:
+                logger.warning("bitsandbytes not installed, skipping 8-bit optimization")
+        
+        logger.info(f"Model created with {model.num_parameters():,} parameters")
+        return model
+    
+    except Exception as e:
+        logger.error(f"Error creating model: {str(e)}")
+        logger.info("Creating a smaller model for testing...")
+        return GPT2LMHeadModel.from_pretrained("gpt2-small")
+
+def compute_metrics(eval_preds):
+    """计算评估指标"""
+    logits, labels = eval_preds
+    predictions = np.argmax(logits, axis=-1)
+    
+    # 计算准确率
+    accuracy = np.mean(predictions == labels)
+    
+    return {
+        "accuracy": accuracy.item(),
+        "perplexity": np.exp(-accuracy).item()  # 简化的困惑度计算
+    }
+
+def main():
+    """主训练函数"""
+    console.rule("[bold blue]Language Model Training")
+    start_time = time.time()
+    
+    try:
+        # 设置环境
+        device = setup_environment()
+        
+        # 加载数据
+        tokenized_datasets, tokenizer = load_and_preprocess_data()
+        
+        # 创建模型
+        model = create_model()
+        model.to(device)
+        
+        # 配置训练参数
+        training_args = TrainingArguments(
+            **config.TRAINING_CONFIG,
+            num_train_epochs=config.MODEL_CONFIG["num_epochs"],
+            per_device_train_batch_size=config.MODEL_CONFIG["batch_size"],
+            per_device_eval_batch_size=config.MODEL_CONFIG["batch_size"],
+            gradient_accumulation_steps=config.MODEL_CONFIG["gradient_accumulation_steps"],
+            learning_rate=config.MODEL_CONFIG["learning_rate"],
+            warmup_ratio=config.MODEL_CONFIG["warmup_ratio"],
+            fp16=config.HARDWARE_CONFIG["fp16"],
+            dataloader_num_workers=config.HARDWARE_CONFIG["num_workers"],
+            dataloader_pin_memory=config.HARDWARE_CONFIG["pin_memory"],
+            optim="adamw_torch_fused",
+            lr_scheduler_type="cosine",
+            evaluation_strategy="steps",
+            predict_with_generate=True,
+            logging_first_step=True,
+            push_to_hub=False,
+        )
+        
+        # 创建Trainer
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_datasets["train"],
+            eval_dataset=tokenized_datasets["validation"],
+            data_collator=default_data_collator,
+            compute_metrics=compute_metrics,
+        )
+        
+        # 训练
+        console.rule("[bold green]Starting Training")
+        logger.info(f"Training configuration:")
+        logger.info(f"- Model: {config.MODEL_CONFIG['base_model']}")
+        logger.info(f"- Batch size: {config.MODEL_CONFIG['batch_size']} × {config.MODEL_CONFIG['gradient_accumulation_steps']} = {config.MODEL_CONFIG['batch_size'] * config.MODEL_CONFIG['gradient_accumulation_steps']}")
+        logger.info(f"- Total epochs: {config.MODEL_CONFIG['num_epochs']}")
+        logger.info(f"- Output directory: {config.OUTPUT_DIR}")
+        
+        train_result = trainer.train()
+        
+        # 保存结果
+        console.rule("[bold green]Training Completed")
+        metrics = train_result.metrics
+        
+        # 保存最终模型
+        final_model_dir = os.path.join(config.MODEL_DIR, f"final_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        os.makedirs(final_model_dir, exist_ok=True)
+        
+        trainer.save_model(final_model_dir)
+        tokenizer.save_pretrained(final_model_dir)
+        
+        # 保存训练指标
+        with open(os.path.join(final_model_dir, "training_metrics.txt"), "w") as f:
+            for key, value in metrics.items():
+                f.write(f"{key}: {value}\n")
+        
+        logger.info(f"Model saved to: {final_model_dir}")
+        logger.info(f"Training metrics: {metrics}")
+        
+        # 生成示例文本
+        generate_example_text(model, tokenizer, device)
+        
+        # 总时间
+        total_time = time.time() - start_time
+        logger.info(f"Total training time: {total_time/3600:.2f} hours")
+        
+        return final_model_dir
+        
+    except Exception as e:
+        logger.error(f"Training failed: {str(e)}", exc_info=True)
+        sys.exit(1)
+
+def generate_example_text(model, tokenizer, device):
+    """生成示例文本"""
+    logger.info("Generating example text...")
+    
+    try:
+        model.eval()
+        prompt = "The future of artificial intelligence is"
+        
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=50,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            pad_token_id=tokenizer.eos_token_id
+        )
+        
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        logger.info(f"Generated text: {generated_text}")
+        
+        # 保存生成的文本
+        with open(os.path.join(config.OUTPUT_DIR, "generated_example.txt"), "w") as f:
+            f.write(generated_text)
+            
+    except Exception as e:
+        logger.warning(f"Failed to generate example text: {str(e)}")
+
+if __name__ == "__main__":
+    main()

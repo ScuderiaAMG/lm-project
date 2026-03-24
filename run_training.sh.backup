@@ -1,0 +1,47 @@
+#!/bin/bash
+"""
+语言模型训练启动脚本
+- 激活conda环境
+- 设置环境变量
+- 运行训练
+- 处理中断和恢复
+"""
+
+# 激活conda环境
+source ~/anaconda3/bin/activate
+conda activate lm-training
+
+# 检查环境是否激活成功
+if [ -z "$CONDA_DEFAULT_ENV" ]; then
+    echo "Error: Conda environment not activated properly"
+    echo "Please run: conda activate lm-training"
+    exit 1
+fi
+
+echo "=== Conda environment activated: $CONDA_DEFAULT_ENV ==="
+
+# 设置项目目录
+PROJECT_DIR="$HOME/lm-project"
+cd "$PROJECT_DIR"
+
+# 创建必要的目录
+mkdir -p ./data ./results ./models ./logs
+
+# 运行训练
+echo "=== Starting GPT language model training ==="
+echo "Training will run for approximately 5 days"
+echo "Press Ctrl+C to interrupt training (will save checkpoint)"
+
+# 运行训练脚本
+python train_gpt.py
+
+# 检查训练结果
+if [ $? -eq 0 ]; then
+    echo "=== Training completed successfully ==="
+    echo "Final model saved in the models directory"
+    echo "Generated examples available in the model directory"
+else
+    echo "=== Training interrupted or failed ==="
+    echo "Check the logs in the logs directory for details"
+    echo "You can resume training by running this script again"
+fi

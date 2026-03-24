@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""
+环境验证脚本
+- 检查所有依赖是否正确安装
+- 验证GPU可用性
+- 测试小规模推理
+"""
+
+import torch
+import numpy as np
+import sys
+import platform
+from transformers import pipeline, GPT2Tokenizer, GPT2LMHeadModel
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+import config
+
+console = Console()
+
+def verify_python():
+    """验证Python环境"""
+    table = Table(title="Python Environment")
+    table.add_column("Component", style="cyan")
+    table.add_column("Status", style="green")
+    
+    table.add_row("Python Version", sys.version.split()[0])
+    table.add_row("Platform", platform.platform())
+    table.add_row("Working Directory", config.PROJECT_ROOT)
+    
+    console.print(table)
+
+def verify_pytorch():
+    """验证PyTorch安装"""
+    table = Table(title="PyTorch Configuration")
+    table.add_column("Component", style="cyan")
+    table.add_column("Status", style="green")
+    
+    # 基本信息
+    table.add_row("PyTorch Version", torch.__version__)
+    table.add_row("CUDA Available", str(torch.cuda.is_available()))
+    
+    if torch.cuda.is_available():
+        table.add_row("CUDA Version", torch.version.cuda)
+        table.add_row("GPU Device", torch.cuda.get_device_name(0))
+        table.add_row("GPU Memory", f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        table.add_row("Current Memory Usage", f"{torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+    
+    console.print(table)
+
+def verify_dependencies():
+    """验证关键依赖"""
+    table = Table(title="Dependencies")
+    table.add_column("Package", style="cyan")
+    table.add_column("Version", style="green")
+    table.add_column("Status", style="yellow")
+    
+    dependencies = {
+        "transformers": "4.40.0",
+        "datasets": "2.19.0",
+        "accelerate": "0.30.0",
+        "sentencepiece": None,
+        "tokenizers": None,
+        "numpy": "1.21.0"
+    }
+    
+    for package, required_version in dependencies.items():
+        try:
+            module = __import__(package)
+            version = getattr(module, "__version__", "Unknown")
+            status = "✓" if required_version is None or version.startswith(required_version) else "⚠"
+            table.add_row(package, version, status)
+        except ImportError:
+            table.add_row(package, "Not installed", "✗")
+    
+    console.print(table)
+
+def test_inference():
+    """测试推理功能"""
+    console.rule("[bold blue]Testing Model Inference")
+    
+    try:
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        model = GPT2LMHeadModel.from_pretrained("gpt2")
+        
+        if torch.cuda.is_available():
+            model = model.cuda()
+            console.print("[green]✓ Model loaded on GPU[/green]")
+        else:
+            console.print("[yellow]⚠ Model loaded on CPU[/yellow]")
+        
+        prompt = "Hello, I am"
+        inputs = tokenizer(prompt, return_tensors="pt")
+        
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=20,
+                do_sample=True,
+                temperature=0.7
+            )
+        
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        console.print(Panel(generated_text, title="Generated Text", border_style="green"))
+        
+        console.print("[green]✓ Inference test successful![/green]")
+        return True
+        
+    except Exception as e:
+        console.print(f"[red]✗ Inference test failed: {str(e)}[/red]")
+        return False
+
+def main():
+    """主验证函数"""
+    console.rule("[bold red]Environment Verification")
+    
+    # 验证各个组件
+    verify_python()
+    verify_pytorch()
+    verify_dependencies()
+    
+    # 测试推理
+    success = test_inference()
+    
+    # 总结
+    console.rule("[bold green]Verification Summary")
+    if success:
+        console.print("[bold green]✓ Environment verification successful![/bold green]")
+        console.print(f"[bold blue]Ready to start training![/bold blue]")
+        sys.exit(0)
+    else:
+        console.print("[bold red]✗ Environment verification failed![/bold red]")
+        console.print("[yellow]Please check the error messages above and fix the issues.[/yellow]")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

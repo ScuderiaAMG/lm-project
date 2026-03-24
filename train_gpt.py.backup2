@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""
+修复版：小型GPT语言模型训练脚本
+- 修复WikiText-103数据集处理问题
+- 更好的错误处理和日志记录
+- 针对RTX 4060 8GB显存优化
+"""
+
+import os
+import time
+import logging
+from datetime import datetime
+import torch
+from transformers import (
+    GPT2LMHeadModel,
+    GPT2Tokenizer,
+    TrainingArguments,
+    Trainer,
+    default_data_collator,
+)
+from datasets import load_dataset
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+console = Console()
+
+def setup_environment():
+    """设置环境变量和性能优化"""
+    logger.info("Setting up environment...")
+    
+    # 性能优化
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # 设置设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+    
+    if device.type == "cuda":
+        logger.info(f"CUDA version: {torch.version.cuda}")
+        logger.info(f"GPU device: {torch.cuda.get_device_name(0)}")
+        logger.info(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+    
+    return device
+
+def load_and_preprocess_data():
+    """加载和预处理WikiText-103数据集 - 修复版"""
+    logger.info("Loading and preprocessing WikiText-103 dataset...")
+    
+    try:
+        # 从Hugging Face加载数据集
+        dataset = load_dataset(
+            "wikitext",
+            "wikitext-103-raw-v1",
+            cache_dir="./data",
+            trust_remote_code=True
+        )
+        
+        logger.info(f"Dataset loaded successfully!")
+        logger.info(f"Available splits: {list(dataset.keys())}")
+        
+        # 只使用train和validation分割进行训练
+        if "test" in dataset:
+            logger.info("Removing test split (not needed for training)")
+            dataset = dataset.remove_columns("test")
+        
+        logger.info(f"Train samples: {len(dataset['train']):,}")
+        if "validation" in dataset:
+            logger.info(f"Validation samples: {len(dataset['validation']):,}")
+        else:
+            logger.warning("No validation split found, creating one from train data")
+            dataset = dataset["train"].train_test_split(test_size=0.01, seed=42)
+            dataset["validation"] = dataset.pop("test")
+            logger.info(f"Created validation split with {len(dataset['validation']):,} samples")
+        
+        # 加载tokenizer
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        tokenizer.pad_token = tokenizer.eos_token
+        logger.info("Tokenizer loaded successfully")
+        
+        # Tokenize函数
+        def tokenize_function(examples):
+            return tokenizer(
+                examples["text"],
+                padding="max_length",
+                truncation=True,
+                max_length=512,
+                return_tensors="pt"
+            )
+        
+        # 为每个分割创建缓存文件名
+        cache_file_names = {}
+        for split in dataset.keys():
+            cache_file_names[split] = f"./data/{split}_tokenized.cache"
+            logger.info(f"Cache file for {split}: {cache_file_names[split]}")
+        
+        # 应用tokenize
+        logger.info("Tokenizing dataset...")
+        tokenized_datasets = dataset.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["text", "id"] if "id" in dataset["train"].column_names else ["text"],
+            desc="Tokenizing",
+            load_from_cache_file=True,
+            cache_file_names=cache_file_names
+        )
+        
+        # 设置格式为PyTorch
+        for split in tokenized_datasets.keys():
+            tokenized_datasets[split].set_format(type="torch", columns=["input_ids", "attention_mask"])
+        
+        return tokenized_datasets, tokenizer
+    
+    except Exception as e:
+        logger.error(f"Error loading dataset: {str(e)}")
+        logger.info("Falling back to WikiText-2 dataset (smaller but works)")
+        return load_wikitext2_dataset()
+
+def load_wikitext2_dataset():
+    """回退到WikiText-2数据集"""
+    logger.warning("Using WikiText-2 dataset as fallback (smaller dataset)")
+    
+    dataset = load_dataset(
+        "wikitext",
+        "wikitext-2-raw-v1",
+        cache_dir="./data",
+        trust_remote_code=True
+    )
+    
+    logger.info(f"WikiText-2 dataset loaded successfully!")
+    logger.info(f"Train samples: {len(dataset['train']):,}")
+    logger.info(f"Validation samples: {len(dataset['validation']):,}")
+    
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    def tokenize_function(examples):
+        return tokenizer(
+            examples["text"],
+            padding="max_length",
+            truncation=True,
+            max_length=512,
+            return_tensors="pt"
+        )
+    
+    tokenized_datasets = dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=["text"],
+        desc="Tokenizing WikiText-2"
+    )
+    
+    for split in tokenized_datasets.keys():
+        tokenized_datasets[split].set_format(type="torch", columns=["input_ids", "attention_mask"])
+    
+    return tokenized_datasets, tokenizer
+
+def create_model():
+    """创建和配置GPT-2模型"""
+    logger.info("Creating GPT-2 small model...")
+    
+    # 创建GPT-2 small模型 (124M参数)
+    model = GPT2LMHeadModel.from_pretrained("gpt2")
+    
+    # 启用梯度检查点以节省显存
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing enabled")
+    
+    # 打印模型信息
+    total_params = model.num_parameters()
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    logger.info(f"Model created with {total_params:,} total parameters")
+    logger.info(f"Trainable parameters: {trainable_params:,}")
+    
+    return model
+
+def main():
+    """主训练函数"""
+    console.rule("[bold blue]Small GPT Language Model Training")
+    start_time = time.time()
+    
+    try:
+        # 设置环境
+        device = setup_environment()
+        
+        # 加载数据
+        tokenized_datasets, tokenizer = load_and_preprocess_data()
+        
+        # 创建模型
+        model = create_model()
+        model.to(device)
+        
+        # 配置训练参数 (针对RTX 4060 8GB优化)
+        training_args = TrainingArguments(
+            output_dir="./results",
+            overwrite_output_dir=True,
+            num_train_epochs=5,  # 5天训练
+            per_device_train_batch_size=4,  # 每设备batch size
+            per_device_eval_batch_size=4,
+            gradient_accumulation_steps=8,  # 梯度累积步数 (有效batch size = 4 × 8 = 32)
+            learning_rate=5e-5,
+            weight_decay=0.01,
+            fp16=True,  # 混合精度训练
+            logging_steps=100,
+            save_steps=500,
+            eval_steps=500,
+            evaluation_strategy="steps",
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            report_to="none",  # 不使用wandb
+            dataloader_num_workers=4,
+            optim="adamw_torch_fused",  # 更快的优化器
+            lr_scheduler_type="cosine",
+            warmup_ratio=0.1,
+            save_total_limit=3,
+            logging_dir="./logs",
+        )
+        
+        # 创建Trainer
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_datasets["train"],
+            eval_dataset=tokenized_datasets.get("validation", None),
+            data_collator=default_data_collator,
+        )
+        
+        # 开始训练
+        console.rule("[bold green]Starting Training")
+        logger.info("Training configuration:")
+        logger.info(f"- Model: GPT-2 small (124M parameters)")
+        logger.info(f"- Effective batch size: {training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps}")
+        logger.info(f"- Total epochs: {training_args.num_train_epochs}")
+        logger.info(f"- Output directory: {training_args.output_dir}")
+        
+        # 检查验证数据集
+        if tokenized_datasets.get("validation") is None:
+            logger.warning("No validation dataset available. Training will proceed without validation.")
+            training_args.evaluation_strategy = "no"
+        
+        train_result = trainer.train()
+        
+        # 保存结果
+        console.rule("[bold green]Training Completed")
+        metrics = train_result.metrics
+        
+        # 保存最终模型
+        final_model_dir = f"./models/final_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(final_model_dir, exist_ok=True)
+        
+        trainer.save_model(final_model_dir)
+        tokenizer.save_pretrained(final_model_dir)
+        
+        # 保存训练指标
+        with open(os.path.join(final_model_dir, "training_metrics.txt"), "w") as f:
+            for key, value in metrics.items():
+                f.write(f"{key}: {value}\n")
+        
+        logger.info(f"Final model saved to: {final_model_dir}")
+        logger.info(f"Training metrics: {metrics}")
+        
+        # 生成示例文本
+        generate_example_text(model, tokenizer, device, final_model_dir)
+        
+        # 总时间
+        total_time = time.time() - start_time
+        logger.info(f"Total training time: {total_time/3600:.2f} hours")
+        
+        return final_model_dir
+        
+    except Exception as e:
+        logger.error(f"Training failed: {str(e)}", exc_info=True)
+        raise
+
+def generate_example_text(model, tokenizer, device, output_dir):
+    """生成示例文本并保存"""
+    logger.info("Generating example text...")
+    
+    try:
+        model.eval()
+        prompts = [
+            "The future of artificial intelligence is",
+            "Machine learning has revolutionized",
+            "Natural language processing allows computers to",
+            "In the next decade, technology will"
+        ]
+        
+        generated_texts = []
+        
+        for prompt in prompts:
+            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=50,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+            
+            generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            generated_texts.append(generated_text)
+            logger.info(f"Prompt: '{prompt}'")
+            logger.info(f"Generated: '{generated_text}'")
+        
+        # 保存生成的文本
+        with open(os.path.join(output_dir, "generated_examples.txt"), "w") as f:
+            for i, text in enumerate(generated_texts):
+                f.write(f"Example {i+1}:\n{text}\n\n")
+        
+        logger.info("Generated examples saved successfully!")
+        
+    except Exception as e:
+        logger.warning(f"Failed to generate example text: {str(e)}")
+
+if __name__ == "__main__":
+    main()

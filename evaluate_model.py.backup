@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+import torch
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from datasets import load_dataset
+
+# 加载模型和tokenizer
+model_dir = "./models/final_model_20260115_044955"
+tokenizer = GPT2Tokenizer.from_pretrained(model_dir)
+model = GPT2LMHeadModel.from_pretrained(model_dir).cuda()
+
+# 加载验证数据集
+dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
+
+# 评估困惑度
+def calculate_perplexity(texts):
+    total_loss = 0
+    total_tokens = 0
+    
+    for text in texts[:100]:  # 评估前100个样本
+        if len(text) < 10:
+            continue
+            
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to("cuda")
+        with torch.no_grad():
+            outputs = model(**inputs, labels=inputs["input_ids"])
+            loss = outputs.loss
+            total_loss += loss.item() * inputs["input_ids"].size(1)
+            total_tokens += inputs["input_ids"].size(1)
+    
+    perplexity = torch.exp(torch.tensor(total_loss / total_tokens))
+    return perplexity.item()
+
+perplexity = calculate_perplexity(dataset["text"])
+print(f"Model perplexity: {perplexity:.2f}")
